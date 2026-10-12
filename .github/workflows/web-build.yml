@@ -1,0 +1,54 @@
+# Builds only the browser version of PhotoCraft and publishes it as an artifact.
+# Added by Man5040/estudio on the `bridge` branch; upstream code is unchanged.
+# Same toolchain and packaging as upstream's ci.yml `web` job.
+name: web build
+
+on:
+  push:
+    branches: [bridge]
+  workflow_dispatch:
+
+concurrency:
+  group: web-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TRUNK_VERSION: 0.21.14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web-build
+          cache-on-failure: true
+      - name: Install trunk
+        run: |
+          curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$HOME/.cargo/bin" trunk
+          trunk --version
+      # Upstream's script: Trunk release build, relative-URL check, 24 MiB wasm limit, zip.
+      - name: Build and package
+        env:
+          DIST: ${{ github.workspace }}/dist/release
+        run: packaging/web/package.sh
+      - name: Report size
+        run: |
+          {
+            echo "### PhotoCraft web"
+            echo
+            echo '```'
+            ls -l dist/release/*.zip dist/web/*.wasm
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: photocraft-web
+          path: dist/release/photocraft-web-*.zip
+          if-no-files-found: error
+          retention-days: 90
