@@ -12,7 +12,8 @@
 //! - dropped files are read asynchronously by `web::WebShell` and delivered through the inbox.
 //!
 //! URL query flags: `?cpu` forces the CPU canvas path (same as `PHOTOCRAFT_CPU_CANVAS=1`);
-//! `?webgl` forces the WebGL2 backend instead of WebGPU.
+//! `?webgl` forces the WebGL2 backend instead of WebGPU; `?bridge` (inside a frame) talks to the
+//! embedding page, see `bridge.rs`; `?lang=<code>` sets the interface language.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -24,6 +25,9 @@ mod indexed_presets;
 
 #[cfg(target_arch = "wasm32")]
 mod web;
+
+#[cfg(target_arch = "wasm32")]
+mod bridge;
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
