@@ -43,6 +43,10 @@ pub struct Bridge {
     control: Sender<ControlRequest>,
     waiting: Vec<(wasm_bindgen::JsValue, Receiver<serde_json::Value>)>,
     unsaved: Option<bool>,
+    /// A language to switch the interface to on the next frame. It goes into the app's
+    /// `interface.language` preference: the app applies that preference every frame, so setting
+    /// only the current language would last one frame.
+    language: Arc<Mutex<Option<String>>>,
 }
 
 /// Whether this page is an embedded editor that should talk to its parent.
@@ -53,17 +57,18 @@ pub fn wanted(query: &str) -> bool {
     embedded && query.split(['?', '&']).any(|p| p == "bridge")
 }
 
-/// The interface language from the URL (`?lang=es`), so the first frame is already in it.
-pub fn language_from(query: &str) {
-    if let Some(code) = query.split(['?', '&']).find_map(|p| p.strip_prefix("lang=")) {
-        set_language(code);
-    }
+/// The interface language asked for in the URL (`?lang=es`), if any.
+pub fn language_from(query: &str) -> Option<String> {
+    query.split(['?', '&']).find_map(|p| p.strip_prefix("lang=")).map(str::to_string)
 }
 
-fn set_language(code: &str) {
-    match i18n::Lang::from_code(code) {
-        Some(lang) => i18n::set_current(lang),
-        None => log::warn!("bridge: unknown language {code}"),
+/// A language the app knows, or `None` (logged).
+fn known_language(code: &str) -> Option<String> {
+    if i18n::Lang::from_code(code).is_some() {
+        Some(code.to_ascii_lowercase())
+    } else {
+        log::warn!("bridge: unknown language {code}");
+        None
     }
 }
 
@@ -74,11 +79,13 @@ fn get(value: &wasm_bindgen::JsValue, key: &str) -> wasm_bindgen::JsValue {
 impl Bridge {
     /// Starts listening to the parent. `inbox` is where documents to open go (the app opens them
     /// on its next frame); `control` feeds the app's control channel (`PhotocraftApp::with_control`).
-    pub fn start(inbox: Arc<Mutex<Vec<(String, Vec<u8>)>>>, outbox: Outbox, control: Sender<ControlRequest>, ctx: egui::Context) -> Option<Self> {
+    pub fn start(inbox: Arc<Mutex<Vec<(String, Vec<u8>)>>>, outbox: Outbox, control: Sender<ControlRequest>, language: Option<String>, ctx: egui::Context) -> Option<Self> {
         let window = web_sys::window()?;
         let origin = window.location().origin().ok()?;
         let incoming: Arc<Mutex<Vec<Incoming>>> = Arc::default();
         let queue = incoming.clone();
+        let language = Arc::new(Mutex::new(language.as_deref().and_then(known_language)));
+        let wanted_language = language.clone();
         let accepted = origin.clone();
         let listener = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
             if event.origin() != accepted {
@@ -90,8 +97,8 @@ impl Bridge {
                 "open" => {
                     let name = get(&data, "name").as_string().unwrap_or_else(|| "document.psd".into());
                     let bytes = js_sys::Uint8Array::new(&get(&data, "bytes")).to_vec();
-                    if let Some(code) = get(&data, "language").as_string() {
-                        set_language(&code);
+                    if let Some(code) = get(&data, "language").as_string().as_deref().and_then(known_language) {
+                        *wanted_language.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
                     }
                     inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
                 }
@@ -115,7 +122,7 @@ impl Bridge {
         window.add_event_listener_with_callback("message", listener.as_ref().unchecked_ref()).ok()?;
         // The listener lives as long as the page.
         listener.forget();
-        let bridge = Self { origin, incoming, outbox, control, waiting: Vec::new(), unsaved: None };
+        let bridge = Self { origin, incoming, outbox, control, waiting: Vec::new(), unsaved: None, language };
         bridge.post(&[("type", "ready".into()), ("version", env!("CARGO_PKG_VERSION").into())]);
         Some(bridge)
     }
@@ -138,6 +145,11 @@ impl Bridge {
 
     /// Once per frame, with the app: run what the parent asked for, and tell it what changed.
     pub fn tick(&mut self, app: &mut PhotocraftApp) {
+        if let Some(code) = self.language.lock().unwrap_or_else(|e| e.into_inner()).take()
+            && app.session.prefs().interface.language != code
+        {
+            app.session.edit_prefs(|p| p.interface.language = code);
+        }
         let incoming = std::mem::take(&mut *self.incoming.lock().unwrap_or_else(|e| e.into_inner()));
         for message in incoming {
             match message {

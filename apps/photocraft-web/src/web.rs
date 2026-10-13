@@ -54,7 +54,7 @@ pub fn start() {
         };
         let q = query();
         let force_cpu = q.contains("cpu");
-        crate::bridge::language_from(&q);
+        let language = crate::bridge::language_from(&q);
         let bridged = crate::bridge::wanted(&q);
         let mut options = eframe::WebOptions::default();
         photocraft_ui_egui::gpu_canvas::use_adapter_limits(&mut options.wgpu_options.wgpu_setup);
@@ -99,7 +99,7 @@ pub fn start() {
                         app.set_wgpu(rs);
                     }
                     let (control_tx, control_rx) = std::sync::mpsc::channel();
-                    let bridge = if bridged { crate::bridge::Bridge::start(inbox.clone(), outbox, control_tx, cc.egui_ctx.clone()) } else { None };
+                    let bridge = if bridged { crate::bridge::Bridge::start(inbox.clone(), outbox, control_tx, language.clone(), cc.egui_ctx.clone()) } else { None };
                     if bridge.is_some() {
                         app = app.with_control(control_rx);
                     }
