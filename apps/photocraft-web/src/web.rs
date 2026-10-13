@@ -54,6 +54,8 @@ pub fn start() {
         };
         let q = query();
         let force_cpu = q.contains("cpu");
+        crate::bridge::language_from(&q);
+        let bridged = crate::bridge::wanted(&q);
         let mut options = eframe::WebOptions::default();
         photocraft_ui_egui::gpu_canvas::use_adapter_limits(&mut options.wgpu_options.wgpu_setup);
         if q.contains("webgl")
@@ -79,11 +81,12 @@ pub fn start() {
                 Box::new(move |cc| {
                     PhotocraftApp::setup_context(&cc.egui_ctx, ThemeKind::Pro);
                     let inbox: Inbox = Arc::default();
+                    let outbox: crate::bridge::Outbox = Arc::default();
                     let served: Served = Arc::default();
                     load_font_manifest(served.clone(), cc.egui_ctx.clone());
                     let (session, warnings) = crate::preset_bridge::session(presets.clone());
                     preset_warnings.extend(warnings);
-                    let mut app = PhotocraftApp::new(session, services(inbox.clone()));
+                    let mut app = PhotocraftApp::new(session, services(inbox.clone(), bridged.then(|| outbox.clone())));
                     if !preset_warnings.is_empty() {
                         photocraft_ui_egui::notices::post(&mut app, i18n::t("Some brush presets could not be loaded"), preset_warnings, true, None);
                     }
@@ -95,9 +98,14 @@ pub fn start() {
                         log::info!("photocraft-web: wgpu backend {:?}", rs.adapter.get_info().backend);
                         app.set_wgpu(rs);
                     }
+                    let (control_tx, control_rx) = std::sync::mpsc::channel();
+                    let bridge = if bridged { crate::bridge::Bridge::start(inbox.clone(), outbox, control_tx, cc.egui_ctx.clone()) } else { None };
+                    if bridge.is_some() {
+                        app = app.with_control(control_rx);
+                    }
                     let unsaved = Arc::new(AtomicBool::new(false));
                     guard_unload(unsaved.clone());
-                    Ok(Box::new(WebShell { app, inbox, unsaved, served, database, presets }))
+                    Ok(Box::new(WebShell { app, inbox, unsaved, served, database, presets, bridge }))
                 }),
             )
             .await;
@@ -228,6 +236,8 @@ struct WebShell {
     served: Served,
     database: Option<web_sys::IdbDatabase>,
     presets: crate::preset_bridge::Bridge,
+    /// Talks to the embedding page (`?bridge`), see `bridge.rs`.
+    bridge: Option<crate::bridge::Bridge>,
 }
 
 impl WebShell {
@@ -301,6 +311,9 @@ impl eframe::App for WebShell {
         }
         self.serve_fonts(ctx);
         self.app.logic(ctx, frame);
+        if let Some(bridge) = &mut self.bridge {
+            bridge.tick(&mut self.app);
+        }
         self.save_presets(ctx);
     }
 
@@ -333,7 +346,15 @@ impl eframe::App for WebShell {
     }
 }
 
-fn services(inbox: Inbox) -> Services {
+/// With `outbox` (embedded with the bridge), saves go to the embedding page instead of a download.
+fn services(inbox: Inbox, outbox: Option<crate::bridge::Outbox>) -> Services {
+    let to_page = |outbox: crate::bridge::Outbox| -> Box<dyn FnMut(&str, &[u8]) -> Result<(), String>> {
+        Box::new(move |path: &str, bytes: &[u8]| {
+            let name = std::path::Path::new(path).file_name().map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string());
+            outbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes.to_vec()));
+            Ok(())
+        })
+    };
     Services {
         screen_pick: screen_color_service(),
         import: Some(Box::new(|name: &str, bytes: &[u8], max_svg_group_depth: usize| {
@@ -386,7 +407,11 @@ fn services(inbox: Inbox) -> Services {
                 reply.send(Some(FileDialogAnswer::SaveTo(name)));
             }
         })),
-        write: Some(Box::new(|path: &str, bytes: &[u8]| download(path, bytes))),
+        automation_write: outbox.clone().map(to_page),
+        write: Some(match outbox {
+            Some(outbox) => to_page(outbox),
+            None => Box::new(|path: &str, bytes: &[u8]| download(path, bytes)),
+        }),
         encode_png: Some(Box::new(|w, h, rgba| {
             let img = Image::from_u8(w, h, ChannelLayout::Rgba, rgba.to_vec()).map_err(|e| e.to_string())?;
             photocraft_codecs::encode(&img, photocraft_codecs::Format::Png, &EncodeOptions::default()).map_err(|e| e.to_string())
