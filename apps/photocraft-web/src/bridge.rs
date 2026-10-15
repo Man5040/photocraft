@@ -26,7 +26,7 @@
 //!   the tool options (the options bar estudio draws itself; most have no `ui.set` field).
 //! - in `{type: "thumbnails", id, side}` → out `{type: "thumbnails", id, document, layers}`: RGBA
 //!   thumbnails (`{width, height, pixels}`) of the document and of each layer with pixels (`id`).
-//! - in `{type: "live", id, quad?, pivot?, interpolation?, mode?, warp?, warpStyle?, crop?, action?}`
+//! - in `{type: "live", id, quad?, pivot?, skewV?, interpolation?, mode?, warp?, warpStyle?, crop?, action?}`
 //!   → out `{type: "live", id, ok, error?}`: the boxes on the canvas that only the options bar
 //!   edits in the app (estudio draws that bar itself): the Free Transform / Warp box (`quad`,
 //!   `pivot`, `mode`, the warp's `warpStyle` and `warp {bend, hDistort, vDistort, vertical}`) and
@@ -360,6 +360,11 @@ fn live(app: &mut PhotocraftApp, m: &serde_json::Value) -> Result<(), String> {
         }
         if let Some(p) = m.get("pivot").and_then(point) {
             t.pivot = p;
+        }
+        // The V skew last typed: any box reads as some scale, skew and turn with any V skew, so
+        // the options bar keeps the typed one (as the app's own bar does).
+        if let Some(v) = m.get("skewV").and_then(serde_json::Value::as_f64) {
+            t.skew_v = v.clamp(-89.0, 89.0);
         }
         if let Some(i) = m.get("interpolation").and_then(serde_json::Value::as_str) {
             t.interpolation = i.to_string();
