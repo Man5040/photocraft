@@ -34,6 +34,9 @@
 //!   (transform, crop or perspective crop), like ↵ and Esc.
 //! - out `{type: "live-state", transform, crop, perspectiveCrop}` whenever one of those boxes
 //!   changes, from the page or from the pointer on the canvas.
+//! - in `{type: "layer-info", id, layer}` → out `{type: "layer-info", id, mask}`: what
+//!   `document.inspect` leaves out of a layer and estudio's panels show: its pixel mask's
+//!   `{density (0..100), feather (px), enabled, linked}`, or null.
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -54,6 +57,8 @@ enum Incoming {
     Thumbnails(wasm_bindgen::JsValue, u32),
     /// Edits to the transform box or the crop frame, or ending one (`message.action`).
     Live(wasm_bindgen::JsValue, serde_json::Value),
+    /// A layer's pixel mask settings.
+    LayerInfo(wasm_bindgen::JsValue, u64),
 }
 
 pub struct Bridge {
@@ -160,6 +165,12 @@ impl Bridge {
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or(serde_json::Value::Null);
                     queue.lock().unwrap_or_else(|e| e.into_inner()).push(Incoming::Live(get(&data, "id"), message));
+                }
+                "layer-info" => {
+                    let layer = get(&data, "layer").as_f64().unwrap_or(-1.0);
+                    if layer >= 0.0 {
+                        queue.lock().unwrap_or_else(|e| e.into_inner()).push(Incoming::LayerInfo(get(&data, "id"), layer as u64));
+                    }
                 }
                 "thumbnails" => {
                     let side = get(&data, "side").as_f64().unwrap_or(48.0).clamp(16.0, 256.0) as u32;
@@ -275,6 +286,15 @@ impl Bridge {
                         fields.push(("error", e.into()));
                     }
                     self.post(&fields);
+                }
+                Incoming::LayerInfo(id, layer) => {
+                    let mask = app
+                        .session
+                        .active()
+                        .and_then(|st| st.doc.layer(photocraft_doc::LayerId(layer)))
+                        .and_then(|l| l.mask.as_ref())
+                        .map(|m| serde_json::json!({"density": f64::from(m.density) * 100.0, "feather": m.feather, "enabled": m.enabled, "linked": m.linked}));
+                    self.post(&[("type", "layer-info".into()), ("id", id), ("mask", Self::json(&mask.unwrap_or(serde_json::Value::Null)))]);
                 }
                 Incoming::Control(id, method, params) => {
                     let (request, reply) = ControlRequest::new(method, params);
