@@ -36,7 +36,7 @@
 //!   changes, from the page or from the pointer on the canvas.
 //! - in `{type: "layer-info", id, layer}` → out `{type: "layer-info", id, mask}`: what
 //!   `document.inspect` leaves out of a layer and estudio's panels show: its pixel mask's
-//!   `{density (0..100), feather (px), enabled, linked}`, or null.
+//!   `{density (0..100), feather (px), enabled, linked}`, or null, and its `effects` as stored.
 //! - in `{type: "place", id, name, bytes}` → out `{type: "place", id, ok, error?}`: places a file
 //!   (an image, a PSD…) as a smart object layer and starts Free Transform on it, as dropping it
 //!   on the canvas does (estudio's "Upload images").
@@ -332,13 +332,19 @@ impl Bridge {
                     }
                 }
                 Incoming::LayerInfo(id, layer) => {
-                    let mask = app
-                        .session
-                        .active()
-                        .and_then(|st| st.doc.layer(photocraft_doc::LayerId(layer)))
+                    let found = app.session.active().and_then(|st| st.doc.layer(photocraft_doc::LayerId(layer)));
+                    let mask = found
                         .and_then(|l| l.mask.as_ref())
                         .map(|m| serde_json::json!({"density": f64::from(m.density) * 100.0, "feather": m.feather, "enabled": m.enabled, "linked": m.linked}));
-                    self.post(&[("type", "layer-info".into()), ("id", id), ("mask", Self::json(&mask.unwrap_or(serde_json::Value::Null)))]);
+                    // The layer's effects as the document stores them (estudio's Layer Style window
+                    // reads their current values from these).
+                    let effects = found.and_then(|l| serde_json::to_value(&l.effects).ok()).unwrap_or(serde_json::Value::Null);
+                    self.post(&[
+                        ("type", "layer-info".into()),
+                        ("id", id),
+                        ("mask", Self::json(&mask.unwrap_or(serde_json::Value::Null))),
+                        ("effects", Self::json(&effects)),
+                    ]);
                 }
                 Incoming::Control(id, method, params) => {
                     let (request, reply) = ControlRequest::new(method, params);
