@@ -1969,3 +1969,14 @@ mod tests {
         assert_eq!(frame_size([-f64::MAX, 0.0, f64::MAX, 1.0]), None);
     }
 }
+
+/// A frame set from outside the canvas (the estudio bridge's own options bar): a real pending
+/// frame for the active document, as if drawn, so ↵ crops to it.
+pub fn set_frame(app: &mut PhotocraftApp, rect: [f64; 4], angle: Option<f64>) {
+    app.ui.crop_rect = Some(rect);
+    if let Some(a) = angle {
+        app.ui.crop_angle = a;
+    }
+    app.crop.default_frame = false;
+    app.crop.doc = app.session.active().map(|st| st.doc.id);
+}

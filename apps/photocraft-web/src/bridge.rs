@@ -26,6 +26,14 @@
 //!   the tool options (the options bar estudio draws itself; most have no `ui.set` field).
 //! - in `{type: "thumbnails", id, side}` → out `{type: "thumbnails", id, document, layers}`: RGBA
 //!   thumbnails (`{width, height, pixels}`) of the document and of each layer with pixels (`id`).
+//! - in `{type: "live", id, quad?, pivot?, interpolation?, mode?, warp?, warpStyle?, crop?, action?}`
+//!   → out `{type: "live", id, ok, error?}`: the boxes on the canvas that only the options bar
+//!   edits in the app (estudio draws that bar itself): the Free Transform / Warp box (`quad`,
+//!   `pivot`, `mode`, the warp's `warpStyle` and `warp {bend, hDistort, vDistort, vertical}`) and
+//!   the Crop frame (`crop {rect, angle}`); `action` "commit" or "cancel" ends the one in progress
+//!   (transform, crop or perspective crop), like ↵ and Esc.
+//! - out `{type: "live-state", transform, crop, perspectiveCrop}` whenever one of those boxes
+//!   changes, from the page or from the pointer on the canvas.
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -44,6 +52,8 @@ enum Incoming {
     ToolOptions(serde_json::Value),
     /// Thumbnails of the document and of every layer with pixels, at most `side` pixels.
     Thumbnails(wasm_bindgen::JsValue, u32),
+    /// Edits to the transform box or the crop frame, or ending one (`message.action`).
+    Live(wasm_bindgen::JsValue, serde_json::Value),
 }
 
 pub struct Bridge {
@@ -64,6 +74,8 @@ pub struct Bridge {
     /// What the last `state` message described (document revision, active and selected layers,
     /// tool, open dialogs), so a new one goes out only when one of them moves.
     state: String,
+    /// What the last `live-state` message described.
+    live: String,
 }
 
 /// Whether this page is an embedded editor that should talk to its parent.
@@ -141,6 +153,14 @@ impl Bridge {
                         .unwrap_or(serde_json::Value::Null);
                     queue.lock().unwrap_or_else(|e| e.into_inner()).push(Incoming::ToolOptions(options));
                 }
+                "live" => {
+                    let message = js_sys::JSON::stringify(&data)
+                        .ok()
+                        .and_then(|s| s.as_string())
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    queue.lock().unwrap_or_else(|e| e.into_inner()).push(Incoming::Live(get(&data, "id"), message));
+                }
                 "thumbnails" => {
                     let side = get(&data, "side").as_f64().unwrap_or(48.0).clamp(16.0, 256.0) as u32;
                     queue.lock().unwrap_or_else(|e| e.into_inner()).push(Incoming::Thumbnails(get(&data, "id"), side));
@@ -152,7 +172,7 @@ impl Bridge {
         window.add_event_listener_with_callback("message", listener.as_ref().unchecked_ref()).ok()?;
         // The listener lives as long as the page.
         listener.forget();
-        let bridge = Self { origin, incoming, outbox, control, waiting: Vec::new(), unsaved: None, language, ctx, state: String::new() };
+        let bridge = Self { origin, incoming, outbox, control, waiting: Vec::new(), unsaved: None, language, ctx, state: String::new(), live: String::new() };
         bridge.post(&[("type", "ready".into()), ("version", env!("CARGO_PKG_VERSION").into())]);
         Some(bridge)
     }
@@ -245,6 +265,17 @@ impl Bridge {
                     }
                     self.post(&[("type", "thumbnails".into()), ("id", id), ("document", document.into()), ("layers", layers.into())]);
                 }
+                Incoming::Live(id, message) => {
+                    let (ok, error) = match live(app, &message) {
+                        Ok(()) => (true, None),
+                        Err(e) => (false, Some(e)),
+                    };
+                    let mut fields = vec![("type", "live".into()), ("id", id), ("ok", ok.into())];
+                    if let Some(e) = error {
+                        fields.push(("error", e.into()));
+                    }
+                    self.post(&fields);
+                }
                 Incoming::Control(id, method, params) => {
                     let (request, reply) = ControlRequest::new(method, params);
                     if self.control.send(request).is_ok() {
@@ -289,10 +320,126 @@ impl Bridge {
             let revision = doc.map_or(0.0, |d| d.revision as f64);
             self.post(&[("type", "state".into()), ("revision", revision.into())]);
         }
+        // `{type: "live-state", …}` whenever the transform box, the crop frame or the perspective
+        // crop moves (also while the pointer drags it), so estudio's bar follows the canvas.
+        let live_state = serde_json::json!({
+            "transform": app.ui.transform,
+            "crop": if photocraft_ui_egui::crop_ui::pending(app) || app.ui.tool == photocraft_ui_egui::Tool::Crop {
+                serde_json::json!({"rect": app.ui.crop_rect, "angle": app.ui.crop_angle, "pending": photocraft_ui_egui::crop_ui::pending(app)})
+            } else {
+                serde_json::Value::Null
+            },
+            "perspectiveCrop": photocraft_ui_egui::perspective_crop_ui::pending(app),
+        });
+        let live_key = live_state.to_string();
+        if live_key != self.live {
+            self.live = live_key;
+            self.post(&[("type", "live-state".into()), ("transform", Self::json(&live_state["transform"])), ("crop", Self::json(&live_state["crop"])), ("perspectiveCrop", Self::json(&live_state["perspectiveCrop"]))]);
+        }
         let unsaved = app.has_unsaved_work();
         if self.unsaved != Some(unsaved) {
             self.unsaved = Some(unsaved);
             self.post(&[("type", "changed".into()), ("unsaved", unsaved.into())]);
         }
     }
+}
+
+/// One `live` message: edit the transform box or the crop frame, then commit or cancel.
+fn live(app: &mut PhotocraftApp, m: &serde_json::Value) -> Result<(), String> {
+    use photocraft_geom::warp::{BezierMesh, Warp, WarpStyle};
+    use photocraft_ui_egui::{crop_ui, perspective_crop_ui, transform_tool};
+    let point = |v: &serde_json::Value| -> Option<[f64; 2]> { Some([v.get(0)?.as_f64()?, v.get(1)?.as_f64()?]) };
+    if let Some(t) = app.ui.transform.as_mut() {
+        if let Some(q) = m.get("quad").and_then(serde_json::Value::as_array) {
+            let corners: Vec<[f64; 2]> = q.iter().filter_map(point).collect();
+            let quad: [[f64; 2]; 4] = corners.try_into().map_err(|_| "quad needs four [x, y] corners".to_string())?;
+            if quad.iter().flatten().any(|v| !v.is_finite()) {
+                return Err("quad must be finite".into());
+            }
+            t.quad = quad;
+        }
+        if let Some(p) = m.get("pivot").and_then(point) {
+            t.pivot = p;
+        }
+        if let Some(i) = m.get("interpolation").and_then(serde_json::Value::as_str) {
+            t.interpolation = i.to_string();
+        }
+        if let Some(mode) = m.get("mode") {
+            t.mode = serde_json::from_value(mode.clone()).map_err(|e| format!("mode: {e}"))?;
+        }
+        if let Some(style) = m.get("warpStyle") {
+            let style: WarpStyle = serde_json::from_value(style.clone()).map_err(|e| format!("warpStyle: {e}"))?;
+            let Some(w) = t.warp.clone() else { return Err("not warping".into()) };
+            let b = t.rect;
+            // As the Warp options bar's style menu does.
+            t.warp = Some(match style {
+                WarpStyle::Custom => Warp::custom(w.to_mesh(1, 1), b),
+                WarpStyle::None => Warp::custom(BezierMesh::identity(b, 1, 1), b),
+                s => Warp { style: s, bend: if w.style.is_preset() { w.bend } else { 50.0 }, ..Warp::none(b) },
+            });
+        }
+        if let Some(fields) = m.get("warp").and_then(serde_json::Value::as_object) {
+            let Some(w) = t.warp.as_mut() else { return Err("not warping".into()) };
+            let pct = |k: &str| fields.get(k).and_then(serde_json::Value::as_f64).map(|v| v.clamp(-100.0, 100.0));
+            if let Some(v) = pct("bend") {
+                w.bend = v;
+            }
+            if let Some(v) = pct("hDistort") {
+                w.h_distort = v;
+            }
+            if let Some(v) = pct("vDistort") {
+                w.v_distort = v;
+            }
+            if let Some(v) = fields.get("vertical").and_then(serde_json::Value::as_bool) {
+                w.vertical = v;
+            }
+        }
+    } else if m.get("quad").is_some() || m.get("warp").is_some() || m.get("warpStyle").is_some() {
+        return Err("no transform in progress".into());
+    }
+    if let Some(c) = m.get("crop").and_then(serde_json::Value::as_object) {
+        if app.ui.tool != photocraft_ui_egui::Tool::Crop {
+            return Err("the Crop tool is not picked".into());
+        }
+        let angle = c.get("angle").and_then(serde_json::Value::as_f64);
+        let rect = match c.get("rect").and_then(serde_json::Value::as_array) {
+            Some(r) => {
+                let v: Vec<f64> = r.iter().filter_map(serde_json::Value::as_f64).collect();
+                let rect: [f64; 4] = v.try_into().map_err(|_| "crop.rect needs [x0, y0, x1, y1]".to_string())?;
+                if rect[2] - rect[0] < 1.0 || rect[3] - rect[1] < 1.0 {
+                    return Err("crop.rect is empty".into());
+                }
+                rect
+            }
+            None => app.ui.crop_rect.ok_or("no crop frame")?,
+        };
+        crop_ui::set_frame(app, rect, angle);
+    }
+    match m.get("action").and_then(serde_json::Value::as_str) {
+        None => {}
+        Some("commit") => {
+            if app.ui.transform.is_some() {
+                transform_tool::commit(app);
+            } else if crop_ui::pending(app) {
+                photocraft_ui_egui::canvas::commit_crop(app);
+            } else if perspective_crop_ui::pending(app) {
+                perspective_crop_ui::commit(app);
+            } else {
+                return Err("nothing to commit".into());
+            }
+        }
+        Some("cancel") => {
+            if app.ui.transform.is_some() {
+                transform_tool::cancel(app);
+            } else if crop_ui::pending(app) {
+                crop_ui::cancel(app);
+            } else if perspective_crop_ui::pending(app) {
+                perspective_crop_ui::cancel(app);
+            } else {
+                return Err("nothing to cancel".into());
+            }
+        }
+        Some(other) => return Err(format!("unknown action `{other}`")),
+    }
+    Ok(())
 }
