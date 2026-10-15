@@ -23,6 +23,8 @@ photocraft-engine = { workspace = true }
 photocraft-io = { workspace = true }
 photocraft-codecs = { workspace = true }
 photocraft-doc = { workspace = true }
+photocraft-raster = { workspace = true }
+photocraft-compose = { workspace = true }
 photocraft-ui-egui = { workspace = true }
 egui = { workspace = true }
 log = { workspace = true }

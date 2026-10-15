@@ -22,6 +22,10 @@
 //!   which no longer downloads a file while embedded; `{type: "save-failed", error}`;
 //! - `{type: "changed", unsaved}` whenever the app gains or loses unsaved changes;
 //! - `{type: "reply", id, result}`.
+//! - in `{type: "tool-options", options}` → out `{type: "tool-options", ok}`: merges fields into
+//!   the tool options (the options bar estudio draws itself; most have no `ui.set` field).
+//! - in `{type: "thumbnails", id, side}` → out `{type: "thumbnails", id, document, layers}`: RGBA
+//!   thumbnails (`{width, height, pixels}`) of the document and of each layer with pixels (`id`).
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -36,6 +40,10 @@ pub type Outbox = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 enum Incoming {
     Save(String),
     Control(wasm_bindgen::JsValue, String, serde_json::Value),
+    /// Fields to merge into the tool options (the options bar's state), as `ui.inspect` names them.
+    ToolOptions(serde_json::Value),
+    /// Thumbnails of the document and of every layer with pixels, at most `side` pixels.
+    Thumbnails(wasm_bindgen::JsValue, u32),
 }
 
 pub struct Bridge {
@@ -125,6 +133,18 @@ impl Bridge {
                     let method = get(&data, "method").as_string().unwrap_or_default();
                     queue.lock().unwrap_or_else(|e| e.into_inner()).push(Incoming::Control(get(&data, "id"), method, params));
                 }
+                "tool-options" => {
+                    let options = js_sys::JSON::stringify(&get(&data, "options"))
+                        .ok()
+                        .and_then(|s| s.as_string())
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    queue.lock().unwrap_or_else(|e| e.into_inner()).push(Incoming::ToolOptions(options));
+                }
+                "thumbnails" => {
+                    let side = get(&data, "side").as_f64().unwrap_or(48.0).clamp(16.0, 256.0) as u32;
+                    queue.lock().unwrap_or_else(|e| e.into_inner()).push(Incoming::Thumbnails(get(&data, "id"), side));
+                }
                 _ => return,
             }
             repaint.request_repaint();
@@ -167,6 +187,63 @@ impl Bridge {
                     if let Err(error) = app.save_automation(Some(name)) {
                         self.post(&[("type", "save-failed".into()), ("error", error.into())]);
                     }
+                }
+                Incoming::ToolOptions(patch) => {
+                    let mut ok = false;
+                    if let (Ok(serde_json::Value::Object(mut current)), serde_json::Value::Object(patch)) = (serde_json::to_value(&app.ui.tool_options), patch) {
+                        for (key, value) in patch {
+                            current.insert(key, value);
+                        }
+                        if let Ok(options) = serde_json::from_value(serde_json::Value::Object(current)) {
+                            app.ui.tool_options = options;
+                            ok = true;
+                        }
+                    }
+                    self.post(&[("type", "tool-options".into()), ("ok", ok.into())]);
+                }
+                Incoming::Thumbnails(id, side) => {
+                    let Some(state) = app.session.active() else { continue };
+                    let doc = &state.doc;
+                    let image = |width: u32, height: u32, pixels: &[u8]| {
+                        let o = js_sys::Object::new();
+                        let _ = js_sys::Reflect::set(&o, &"width".into(), &(width as f64).into());
+                        let _ = js_sys::Reflect::set(&o, &"height".into(), &(height as f64).into());
+                        let _ = js_sys::Reflect::set(&o, &"pixels".into(), &js_sys::Uint8Array::from(pixels).into());
+                        o
+                    };
+                    let whole = photocraft_compose::thumbnail(doc, side);
+                    let document = image(whole.width, whole.height, &whole.pixels);
+                    // Each layer with pixels, laid out in document space like the Layers panel's own
+                    // thumbnails (`thumb_image` in photocraft-ui-egui): a `side`-square, centred.
+                    let layers = js_sys::Array::new();
+                    let (w, h) = (doc.size.width.max(1) as f32, doc.size.height.max(1) as f32);
+                    let scale = w.max(h) / side as f32;
+                    let (ox, oy) = ((side as f32 - w / scale) / 2.0, (side as f32 - h / scale) / 2.0);
+                    let mut px = [0.0f32; 8];
+                    for (_, _, layer) in doc.walk() {
+                        let Some(surface) = layer.surface() else { continue };
+                        let n = surface.channels().min(px.len());
+                        let mut pixels = vec![0u8; (side * side * 4) as usize];
+                        for ty in 0..side {
+                            for tx in 0..side {
+                                let dx = (tx as f32 - ox + 0.5) * scale;
+                                let dy = (ty as f32 - oy + 0.5) * scale;
+                                if dx < 0.0 || dy < 0.0 || dx >= w || dy >= h {
+                                    continue;
+                                }
+                                surface.read_pixel(dx as i32, dy as i32, &mut px[..n]);
+                                let c = photocraft_raster::to_rgba(&surface.format(), &px[..n]);
+                                let at = ((ty * side + tx) * 4) as usize;
+                                for k in 0..4 {
+                                    pixels[at + k] = (c[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                                }
+                            }
+                        }
+                        let o = image(side, side, &pixels);
+                        let _ = js_sys::Reflect::set(&o, &"id".into(), &(layer.id.0 as f64).into());
+                        layers.push(&o);
+                    }
+                    self.post(&[("type", "thumbnails".into()), ("id", id), ("document", document.into()), ("layers", layers.into())]);
                 }
                 Incoming::Control(id, method, params) => {
                     let (request, reply) = ControlRequest::new(method, params);
