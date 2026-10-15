@@ -11,6 +11,8 @@
 //!   file) and switches the interface language when one is given (`"es"`, `"en"`, …);
 //! - `{type: "save", name?}`: saves the active document as a layered file named `name` (default
 //!   `document.psd`); the bytes come back as `saved`;
+//! - out `{type: "state", revision}`: the document, the layers picked, the tool or the open
+//!   dialogs changed (estudio's panels re-read then).
 //! - `{type: "control", id, method, params}`: one control request; the answer comes back as
 //!   `reply {id, result}`.
 //!
@@ -51,6 +53,9 @@ pub struct Bridge {
     /// at the start of a frame and the bridge feeds it at the end, and the app draws a new frame
     /// only when something happens, so without this a request could wait for the next mouse move.
     ctx: egui::Context,
+    /// What the last `state` message described (document revision, active and selected layers,
+    /// tool, open dialogs), so a new one goes out only when one of them moves.
+    state: String,
 }
 
 /// Whether this page is an embedded editor that should talk to its parent.
@@ -127,7 +132,7 @@ impl Bridge {
         window.add_event_listener_with_callback("message", listener.as_ref().unchecked_ref()).ok()?;
         // The listener lives as long as the page.
         listener.forget();
-        let bridge = Self { origin, incoming, outbox, control, waiting: Vec::new(), unsaved: None, language, ctx };
+        let bridge = Self { origin, incoming, outbox, control, waiting: Vec::new(), unsaved: None, language, ctx, state: String::new() };
         bridge.post(&[("type", "ready".into()), ("version", env!("CARGO_PKG_VERSION").into())]);
         Some(bridge)
     }
@@ -189,6 +194,23 @@ impl Bridge {
         self.waiting = still;
         if !self.waiting.is_empty() {
             self.ctx.request_repaint();
+        }
+        // `{type: "state", revision}` whenever the document, the layers picked, the tool or the
+        // open dialogs change: the embedding page re-reads only then (`document.inspect`,
+        // `ui.inspect`) instead of asking every frame. Selecting a layer is not a revision step.
+        let doc = app.session.active();
+        let state = format!(
+            "{}|{:?}|{:?}|{:?}|{}",
+            doc.map_or(0, |d| d.revision),
+            doc.and_then(|d| d.active_layer),
+            doc.map(|d| d.selected_layers.clone()),
+            app.ui.tool,
+            app.ui.dialogs.len()
+        );
+        if state != self.state {
+            self.state = state;
+            let revision = doc.map_or(0.0, |d| d.revision as f64);
+            self.post(&[("type", "state".into()), ("revision", revision.into())]);
         }
         let unsaved = app.has_unsaved_work();
         if self.unsaved != Some(unsaved) {
