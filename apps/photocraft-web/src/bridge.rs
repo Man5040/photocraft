@@ -47,6 +47,10 @@ pub struct Bridge {
     /// `interface.language` preference: the app applies that preference every frame, so setting
     /// only the current language would last one frame.
     language: Arc<Mutex<Option<String>>>,
+    /// To ask for another frame while control requests wait: the app reads its control channel
+    /// at the start of a frame and the bridge feeds it at the end, and the app draws a new frame
+    /// only when something happens, so without this a request could wait for the next mouse move.
+    ctx: egui::Context,
 }
 
 /// Whether this page is an embedded editor that should talk to its parent.
@@ -87,6 +91,7 @@ impl Bridge {
         let language = Arc::new(Mutex::new(language.as_deref().and_then(known_language)));
         let wanted_language = language.clone();
         let accepted = origin.clone();
+        let repaint = ctx.clone();
         let listener = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
             if event.origin() != accepted {
                 return;
@@ -117,12 +122,12 @@ impl Bridge {
                 }
                 _ => return,
             }
-            ctx.request_repaint();
+            repaint.request_repaint();
         });
         window.add_event_listener_with_callback("message", listener.as_ref().unchecked_ref()).ok()?;
         // The listener lives as long as the page.
         listener.forget();
-        let bridge = Self { origin, incoming, outbox, control, waiting: Vec::new(), unsaved: None, language };
+        let bridge = Self { origin, incoming, outbox, control, waiting: Vec::new(), unsaved: None, language, ctx };
         bridge.post(&[("type", "ready".into()), ("version", env!("CARGO_PKG_VERSION").into())]);
         Some(bridge)
     }
@@ -182,6 +187,9 @@ impl Bridge {
             }
         }
         self.waiting = still;
+        if !self.waiting.is_empty() {
+            self.ctx.request_repaint();
+        }
         let unsaved = app.has_unsaved_work();
         if self.unsaved != Some(unsaved) {
             self.unsaved = Some(unsaved);
