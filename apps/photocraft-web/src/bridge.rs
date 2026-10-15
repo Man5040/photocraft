@@ -37,6 +37,12 @@
 //! - in `{type: "layer-info", id, layer}` → out `{type: "layer-info", id, mask}`: what
 //!   `document.inspect` leaves out of a layer and estudio's panels show: its pixel mask's
 //!   `{density (0..100), feather (px), enabled, linked}`, or null.
+//! - in `{type: "place", id, name, bytes}` → out `{type: "place", id, ok, error?}`: places a file
+//!   (an image, a PSD…) as a smart object layer and starts Free Transform on it, as dropping it
+//!   on the canvas does (estudio's "Upload images").
+//! - in `{type: "export", id, name, quality?, metadata?}` → out `{type: "export", id, bytes?, error?}`:
+//!   the document encoded as `name`'s format (png, jpg, webp, tif, psd…; `quality` 1–100 for
+//!   JPEG and WebP, `metadata` keeps the XMP packet), without touching its saved state.
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -59,6 +65,10 @@ enum Incoming {
     Live(wasm_bindgen::JsValue, serde_json::Value),
     /// A layer's pixel mask settings.
     LayerInfo(wasm_bindgen::JsValue, u64),
+    /// A file to place as a layer: (id, name, bytes).
+    Place(wasm_bindgen::JsValue, String, Vec<u8>),
+    /// The document encoded as a file: (id, name, quality, metadata).
+    Export(wasm_bindgen::JsValue, String, Option<u8>, bool),
 }
 
 pub struct Bridge {
@@ -165,6 +175,17 @@ impl Bridge {
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or(serde_json::Value::Null);
                     queue.lock().unwrap_or_else(|e| e.into_inner()).push(Incoming::Live(get(&data, "id"), message));
+                }
+                "place" => {
+                    let name = get(&data, "name").as_string().unwrap_or_else(|| "image.png".into());
+                    let bytes = js_sys::Uint8Array::new(&get(&data, "bytes")).to_vec();
+                    queue.lock().unwrap_or_else(|e| e.into_inner()).push(Incoming::Place(get(&data, "id"), name, bytes));
+                }
+                "export" => {
+                    let name = get(&data, "name").as_string().unwrap_or_else(|| "export.png".into());
+                    let quality = get(&data, "quality").as_f64().map(|q| q.clamp(1.0, 100.0) as u8);
+                    let metadata = get(&data, "metadata").as_bool().unwrap_or(false);
+                    queue.lock().unwrap_or_else(|e| e.into_inner()).push(Incoming::Export(get(&data, "id"), name, quality, metadata));
                 }
                 "layer-info" => {
                     let layer = get(&data, "layer").as_f64().unwrap_or(-1.0);
@@ -286,6 +307,29 @@ impl Bridge {
                         fields.push(("error", e.into()));
                     }
                     self.post(&fields);
+                }
+                Incoming::Place(id, name, bytes) => {
+                    let placed = photocraft_engine::file_cmds::place_bytes(&mut app.session, &name, bytes, None, &serde_json::json!({})).map_err(|e| e.to_string());
+                    app.sync_views();
+                    let result = placed.and_then(|_| photocraft_ui_egui::transform_tool::begin_placed(app, &self.ctx));
+                    let mut fields = vec![("type", "place".into()), ("id", id), ("ok", result.is_ok().into())];
+                    if let Err(e) = result {
+                        fields.push(("error", e.into()));
+                    }
+                    self.post(&fields);
+                }
+                Incoming::Export(id, name, quality, metadata) => {
+                    let encoded = match (app.session.active(), app.services.export.as_ref()) {
+                        (Some(state), Some(export)) => {
+                            let settings = photocraft_ui_egui::ExportSettings { jpeg_quality: quality, webp_quality: quality, xmp_all: metadata, ..photocraft_ui_egui::ExportSettings::default() };
+                            export(&state.doc, &name, &settings)
+                        }
+                        _ => Err("no document".to_string()),
+                    };
+                    match encoded {
+                        Ok((bytes, _)) => self.post(&[("type", "export".into()), ("id", id), ("bytes", js_sys::Uint8Array::from(bytes.as_slice()).into())]),
+                        Err(e) => self.post(&[("type", "export".into()), ("id", id), ("error", e.into())]),
+                    }
                 }
                 Incoming::LayerInfo(id, layer) => {
                     let mask = app
