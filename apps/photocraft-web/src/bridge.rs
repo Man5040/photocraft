@@ -338,7 +338,9 @@ impl Bridge {
                         .map(|m| serde_json::json!({"density": f64::from(m.density) * 100.0, "feather": m.feather, "enabled": m.enabled, "linked": m.linked}));
                     // The layer's effects as the document stores them (estudio's Layer Style window
                     // reads their current values from these).
-                    let effects = found.and_then(|l| serde_json::to_value(&l.effects).ok()).unwrap_or(serde_json::Value::Null);
+                    let effects = found
+                        .and_then(|l| serde_json::to_value(&l.effects.items).ok().map(|items| serde_json::json!({"enabled": l.effects.enabled, "items": items})))
+                        .unwrap_or(serde_json::Value::Null);
                     self.post(&[
                         ("type", "layer-info".into()),
                         ("id", id),
